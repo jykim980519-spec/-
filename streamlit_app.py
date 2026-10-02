@@ -37,11 +37,12 @@ def normalize_name(raw: object) -> str | None:
     return name
 
 
-_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|~<>$:&])")
+# "/"까지 막아야 :material/home: 같은 아이콘 문법이 해석되지 않는다.
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|~<>$:&/])")
 
 
 def escape_markdown(text: str) -> str:
-    """사용자 입력이 마크다운·HTML·색상 문법으로 해석되지 않게 한다 (XSS 방지)."""
+    """사용자 입력이 마크다운·HTML·색상·아이콘 문법으로 해석되지 않게 한다 (XSS 방지)."""
     return _MARKDOWN_SPECIAL.sub(r"\\\1", text)
 
 
@@ -57,23 +58,30 @@ def load_items() -> list[Item]:
 
     items: list[Item] = []
     seen: set[str] = set()
+    repaired = False
     for raw in parsed:
         if not isinstance(raw, dict):
+            repaired = True
             continue
         name = normalize_name(raw.get("name"))
         if name is None:
+            repaired = True
             continue
-        item_id = raw.get("id") if isinstance(raw.get("id"), str) and raw.get("id") else uuid.uuid4().hex
-        if item_id in seen:
+        item_id = raw.get("id") if isinstance(raw.get("id"), str) and raw.get("id") else None
+        if item_id is None or item_id in seen:
             item_id = uuid.uuid4().hex
         seen.add(item_id)
         created_at = raw.get("createdAt")
-        items.append({
-            "id": item_id,
-            "name": name,
-            "checked": raw.get("checked") is True,
-            "createdAt": created_at if isinstance(created_at, (int, float)) and not isinstance(created_at, bool) else int(time.time() * 1000),
-        })
+        if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+            created_at = int(time.time() * 1000)
+        item = {"id": item_id, "name": name, "checked": raw.get("checked") is True, "createdAt": created_at}
+        repaired = repaired or item != raw
+        items.append(item)
+
+    # 고친 내용(새 id 등)을 바로 저장한다. 저장하지 않으면 다음 rerun에서 id가 또 바뀌어
+    # 버튼 콜백이 아이템을 찾지 못한다.
+    if repaired:
+        save_items(items)
     return items
 
 
@@ -133,8 +141,9 @@ def commit_edit(item_id: str) -> None:
     st.session_state.editing_id = None
 
 
-def cancel_edit() -> None:
+def cancel_edit(item_id: str) -> None:
     st.session_state.editing_id = None
+    st.session_state.pop(f"edit_{item_id}", None)
 
 
 def delete_item(item_id: str) -> None:
@@ -160,13 +169,15 @@ def confirm_clear(count: int) -> None:
         st.rerun()
 
 
+# 이름 · 첫 번째 버튼 · 두 번째 버튼 칸 비율 (보기 모드와 편집 모드가 같은 위치를 쓴다)
+ITEM_COLUMNS = [6, 1.6, 1.6]
+
+
 def render_item(item: Item) -> None:
     item_id = item["id"]
     editing = st.session_state.get("editing_id") == item_id
 
-    check_col, name_col, edit_col, delete_col = st.columns(
-        [0.7, 6, 1.3, 1.3], vertical_alignment="center", gap="small"
-    )
+    check_col, body_col = st.columns([0.8, 9], vertical_alignment="center", gap="small")
 
     check_col.checkbox(
         f"{item['name']} 구매 완료",
@@ -178,22 +189,25 @@ def render_item(item: Item) -> None:
     )
 
     if editing:
-        # Enter를 누르거나 입력창 밖을 클릭하면(값이 바뀐 경우) 저장된다.
-        name_col.text_input(
-            f"{item['name']} 이름 수정",
-            value=item["name"],
-            key=f"edit_{item_id}",
-            max_chars=MAX_NAME_LENGTH,
-            on_change=commit_edit,
-            args=(item_id,),
-            label_visibility="collapsed",
-        )
-        edit_col.button("저장", key=f"save_{item_id}", on_click=commit_edit, args=(item_id,),
-                        type="primary", width="stretch")
-        delete_col.button("취소", key=f"cancel_{item_id}", on_click=cancel_edit,
-                          width="stretch")
+        # 폼은 제출할 때만 값을 보낸다. 그래서 [취소]를 눌러도 입력값이 먼저 저장되지 않는다.
+        # (on_change를 쓰면 [취소] 클릭 전에 blur로 저장 콜백이 먼저 실행된다.)
+        # Enter는 폼의 첫 번째 제출 버튼인 [저장]을 누른 것과 같다.
+        with body_col.form(f"editform_{item_id}", border=False):
+            name_col, save_col, cancel_col = st.columns(ITEM_COLUMNS, vertical_alignment="center", gap="small")
+            name_col.text_input(
+                f"{item['name']} 이름 수정",
+                value=item["name"],
+                key=f"edit_{item_id}",
+                max_chars=MAX_NAME_LENGTH,
+                label_visibility="collapsed",
+            )
+            save_col.form_submit_button("저장", on_click=commit_edit, args=(item_id,),
+                                        type="primary", width="stretch")
+            cancel_col.form_submit_button("취소", on_click=cancel_edit, args=(item_id,),
+                                          width="stretch")
         return
 
+    name_col, edit_col, delete_col = body_col.columns(ITEM_COLUMNS, vertical_alignment="center", gap="small")
     name = escape_markdown(item["name"])
     name_col.markdown(f":gray[~~{name}~~]" if item["checked"] else name)
     edit_col.button("수정", key=f"editbtn_{item_id}", on_click=start_edit, args=(item_id,),
@@ -211,8 +225,34 @@ div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
     min-width: 0 !important;
     width: auto !important;
 }
-div[data-testid="stHorizontalBlock"] button { padding-left: 0.5rem; padding-right: 0.5rem; }
 div[data-testid="stMarkdownContainer"] p { overflow-wrap: anywhere; margin-bottom: 0; }
+
+/* 체크박스 칸은 44px로 고정, 버튼 칸은 글자 크기만큼. 남는 폭은 이름 칸이 쓴다. */
+div[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] > [data-testid="stCheckbox"]) {
+    flex: 0 0 44px !important;
+}
+div[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] > [data-testid="stButton"]),
+div[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] > [data-testid="stFormSubmitButton"]) {
+    flex: 0 0 auto !important;
+}
+
+/* 터치 영역 44×44px 이상 (PRD 5.2), 버튼 글자는 줄바꿈하지 않는다 */
+[data-testid="stButton"] button,
+[data-testid="stFormSubmitButton"] button {
+    min-height: 44px;
+    min-width: 52px;
+    padding: 0 0.75rem;
+}
+[data-testid="stButton"] button p,
+[data-testid="stFormSubmitButton"] button p { white-space: nowrap; }
+[data-testid="stCheckbox"] label {
+    min-width: 44px;
+    min-height: 44px;
+    margin: 0;
+    align-items: center;
+    justify-content: center;
+}
+[data-testid="stTextInput"] input { min-height: 44px; }
 </style>
 """
 
